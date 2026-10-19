@@ -10,11 +10,14 @@
 #include "../../src/llama-ext.h" // llama_model_set_attn_rot
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -718,6 +721,294 @@ struct case_state_restore_fragmented : ctx_test {
     }
 };
 
+//
+// control vectors
+//
+
+// a control vector with a pseudo-random direction of the given norm for every layer but layer 0,
+// in the layout of llama_set_adapter_cvec
+static std::vector<float> cvec_random(int32_t n_embd, int32_t n_layer, float norm, uint32_t seed) {
+    std::vector<float> data((size_t) n_embd * (n_layer - 1), 0.0f);
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (int32_t il = 1; il < n_layer; il++) {
+        float * v = data.data() + (size_t) n_embd * (il - 1);
+
+        double sum = 0.0;
+        for (int32_t i = 0; i < n_embd; i++) {
+            v[i] = dist(rng);
+            sum += (double) v[i] * v[i];
+        }
+
+        const float scale = norm / (float) sqrt(sum);
+        for (int32_t i = 0; i < n_embd; i++) {
+            v[i] *= scale;
+        }
+    }
+
+    return data;
+}
+
+// true when every element compares equal, the first difference is logged
+static bool logits_equal(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size()) {
+        TLOG_ERR("%s: size mismatch (%zu vs %zu)\n", __func__, a.size(), b.size());
+        return false;
+    }
+
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] != b[i]) {
+            TLOG_ERR("%s: first difference at index %zu (%g vs %g)\n", __func__, i, (double) a[i], (double) b[i]);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// - decode a few tokens without a control vector
+// - a zero vector in add mode leaves the logits exactly as they were
+// - a zero vector in project mode does too: there is no direction to project out
+// - a vector with the wrong n_embd and an unknown mode are rejected
+// - clearing the vector restores the logits
+struct case_cvec_add : ctx_test {
+    const char * name() const override { return "cvec_add"; }
+
+    const char * description() const override {
+        return "a zero control vector leaves the logits unchanged, invalid vectors are rejected, clearing restores the logits";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_embd  = llama_model_n_embd(mr.model);
+        const int32_t n_layer = llama_model_n_layer(mr.model);
+        if (n_layer < 2) {
+            return case_result::skip("fewer than 2 layers");
+        }
+
+        ctx_opts opts;
+        opts.n_ctx   = 256;
+        opts.n_batch = 256;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const size_t n_tokens = std::min<size_t>(mr.tokens.size(), 8);
+        const llama_tokens tokens(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+
+        const auto set_cvec = [&](const std::vector<float> & data, llama_adapter_cvec_mode mode) {
+            return llama_set_adapter_cvec_ext(ctx.get(), data.data(), data.size(), n_embd, 1, n_layer - 1, mode);
+        };
+
+        const auto decode = [&](std::vector<float> & logits) {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            return decode_tokens(ctx.get(), tokens) && get_current_logits(ctx.get(), logits);
+        };
+
+        std::vector<float> ref;
+        CTX_REQUIRE(decode(ref), "the reference decode failed");
+
+        const std::vector<float> zeros((size_t) n_embd * (n_layer - 1), 0.0f);
+
+        std::vector<float> out;
+
+        CTX_REQUIRE(set_cvec(zeros, LLAMA_ADAPTER_CVEC_MODE_ADD) == 0, "failed to set a zero control vector in add mode");
+        CTX_REQUIRE(decode(out), "the decode with a zero control vector in add mode failed");
+        CTX_REQUIRE(logits_equal(ref, out), "a zero control vector in add mode changed the logits");
+
+        CTX_REQUIRE(set_cvec(zeros, LLAMA_ADAPTER_CVEC_MODE_PROJECT) == 0, "failed to set a zero control vector in project mode");
+        CTX_REQUIRE(decode(out), "the decode with a zero control vector in project mode failed");
+        CTX_REQUIRE(logits_equal(ref, out), "a zero control vector in project mode changed the logits");
+
+        // rejected before any data is read
+        CTX_REQUIRE(llama_set_adapter_cvec_ext(ctx.get(), zeros.data(), zeros.size(), n_embd + 1, 1, n_layer - 1, LLAMA_ADAPTER_CVEC_MODE_ADD) != 0,
+                "a control vector with the wrong n_embd was accepted");
+        CTX_REQUIRE(llama_set_adapter_cvec_ext(ctx.get(), zeros.data(), zeros.size(), n_embd, 1, n_layer - 1, (llama_adapter_cvec_mode) 7) != 0,
+                "a control vector with an unknown mode was accepted");
+
+        // a vector that does steer, then cleared
+        const auto data = cvec_random(n_embd, n_layer, 1.0f, mr.params.sampling.seed);
+
+        CTX_REQUIRE(set_cvec(data, LLAMA_ADAPTER_CVEC_MODE_PROJECT) == 0, "failed to set a control vector in project mode");
+        CTX_REQUIRE(decode(out), "the decode with a control vector in project mode failed");
+
+        CTX_REQUIRE(llama_set_adapter_cvec_ext(ctx.get(), nullptr, 0, 0, 0, 0, LLAMA_ADAPTER_CVEC_MODE_ADD) == 0, "failed to clear the control vector");
+        CTX_REQUIRE(decode(out), "the decode after clearing the control vector failed");
+        CTX_REQUIRE(logits_equal(ref, out), "clearing the control vector did not restore the logits");
+
+        return case_result::pass();
+    }
+};
+
+// the output of every layer of the last decode, captured through cb_eval
+struct cvec_capture {
+    std::vector<std::vector<float>> l_out; // per layer, empty when the layer was not observed
+
+    void clear() {
+        for (auto & v : l_out) {
+            v.clear();
+        }
+    }
+
+    static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+        auto * cap = (cvec_capture *) user_data;
+
+        const bool is_l_out = strncmp(t->name, "l_out-", 6) == 0;
+        if (ask) {
+            return is_l_out;
+        }
+
+        if (!is_l_out || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return true;
+        }
+
+        const int il = atoi(t->name + 6);
+        if (il < 0 || (size_t) il >= cap->l_out.size()) {
+            return true;
+        }
+
+        auto & dst = cap->l_out[il];
+        dst.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+
+        return true;
+    }
+};
+
+// - capture the output of every layer without a control vector
+// - for each layer on its own, apply a pseudo-random vector in project mode and capture again
+// - a layer whose output did not change does not apply control vectors (or names its output
+//   before applying them), it is not checked
+// - a steered layer output has to be the closed form x - |v| (x . v/|v|) v/|v| of the output x
+//   without the vector, and with |v| = 1 nothing is left along the direction
+struct case_cvec_project : ctx_test {
+    const char * name() const override { return "cvec_prj"; }
+
+    const char * description() const override {
+        return "a control vector in project mode removes the component of every steered layer output along it";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_embd  = llama_model_n_embd(mr.model);
+        const int32_t n_layer = llama_model_n_layer(mr.model);
+        if (n_layer < 2) {
+            return case_result::skip("fewer than 2 layers");
+        }
+
+        cvec_capture cap;
+        cap.l_out.resize(n_layer);
+
+        auto cparams = common_context_params_to_llama(mr.params);
+        cparams.n_ctx             = 256;
+        cparams.n_batch           = 256;
+        cparams.n_ubatch          = 256;
+        cparams.cb_eval           = cvec_capture::cb_eval;
+        cparams.cb_eval_user_data = &cap;
+
+        auto ctx = init_ctx(mr.model, cparams, 0);
+        CTX_REQUIRE(ctx, "failed to create the context");
+
+        const size_t n_tokens = std::min<size_t>(mr.tokens.size(), 8);
+        const llama_tokens tokens(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+
+        const auto decode = [&]() {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            cap.clear();
+            return decode_tokens(ctx.get(), tokens);
+        };
+
+        CTX_REQUIRE(decode(), "the reference decode failed");
+        const std::vector<std::vector<float>> ref = cap.l_out;
+
+        // relative tolerances: the closed form is a handful of f32 operations, the leftover
+        // component is a sum of n_embd products of the output with a unit direction
+        constexpr double nmse_eps = 1e-6;
+        constexpr double dot_eps  = 1e-3;
+
+        int n_steered = 0;
+
+        for (const float norm : { 1.0f, 2.0f }) {
+            const auto data = cvec_random(n_embd, n_layer, norm, mr.params.sampling.seed);
+
+            for (int32_t il = 1; il < n_layer; il++) {
+                const auto & x = ref[il];
+                if (x.empty()) {
+                    continue; // the output of this layer is not observed
+                }
+
+                CTX_REQUIRE(llama_set_adapter_cvec_ext(ctx.get(), data.data(), data.size(), n_embd, il, il, LLAMA_ADAPTER_CVEC_MODE_PROJECT) == 0,
+                        "failed to set the control vector");
+                CTX_REQUIRE(decode(), "the decode with the control vector failed");
+
+                const auto & y = cap.l_out[il];
+                CTX_REQUIRE(y.size() == x.size(), "the output of layer " + std::to_string(il) + " changed size");
+
+                if (compare_logits(x.data(), y.data(), x.size()).nmse() == 0.0) {
+                    continue; // this layer does not apply control vectors
+                }
+                n_steered++;
+
+                const float * v      = data.data() + (size_t) n_embd * (il - 1); // |v| = norm
+                const size_t  n_cols = x.size() / n_embd;
+
+                // expected: x - |v| (x . v/|v|) v/|v| = x - (x . v) v / |v|
+                std::vector<float> expected(x.size());
+                for (size_t c = 0; c < n_cols; c++) {
+                    const float * xc = x.data()        + c*n_embd;
+                    float       * ec = expected.data() + c*n_embd;
+
+                    double dot = 0.0;
+                    for (int32_t i = 0; i < n_embd; i++) {
+                        dot += (double) xc[i] * v[i];
+                    }
+
+                    const double k = dot / norm;
+                    for (int32_t i = 0; i < n_embd; i++) {
+                        ec[i] = (float) (xc[i] - k * v[i]);
+                    }
+                }
+
+                const logits_diff diff = compare_logits(expected.data(), y.data(), x.size());
+                CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                        "layer " + std::to_string(il) + " with |v| = " + std::to_string(norm) + " is not the projection (max diff " +
+                        std::to_string(diff.diff_max) + ", nmse " + std::to_string(diff.nmse()) + ")");
+
+                if (norm != 1.0f) {
+                    continue;
+                }
+
+                // nothing is left along the direction
+                for (size_t c = 0; c < n_cols; c++) {
+                    const float * yc = y.data() + c*n_embd;
+
+                    double dot = 0.0;
+                    double sum = 0.0;
+                    for (int32_t i = 0; i < n_embd; i++) {
+                        dot += (double) yc[i] * v[i];
+                        sum += (double) yc[i] * yc[i];
+                    }
+
+                    CTX_REQUIRE(std::isfinite(sum), "the output of layer " + std::to_string(il) + " is not finite");
+                    CTX_REQUIRE(fabs(dot) <= dot_eps * sqrt(sum),
+                            "layer " + std::to_string(il) + " token " + std::to_string(c) + " keeps a component along the direction (" +
+                            std::to_string(dot) + " of norm " + std::to_string(sqrt(sum)) + ")");
+                }
+            }
+        }
+
+        if (n_steered == 0) {
+            return case_result::skip("the model does not apply control vectors");
+        }
+
+        TLOG_INF("%s: %d steered layer outputs are projections\n", __func__, n_steered);
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_kv_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -733,6 +1024,8 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
+    cases.push_back(std::make_unique<case_cvec_add>());
+    cases.push_back(std::make_unique<case_cvec_project>());
 
     return cases;
 }

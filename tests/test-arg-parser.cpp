@@ -196,6 +196,9 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--control-vector-mode", "hello"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
     {
         common_params penalty_params;
         assert(penalty_params.sampling.penalty_last_n == 64);
@@ -303,6 +306,16 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    assert(params.control_vector_mode == LLAMA_ADAPTER_CVEC_MODE_ADD); // the default
+
+    argv = {"binary_name", "--control-vector-mode", "project"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.control_vector_mode == LLAMA_ADAPTER_CVEC_MODE_PROJECT);
+
+    argv = {"binary_name", "--control-vector-mode", "add"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.control_vector_mode == LLAMA_ADAPTER_CVEC_MODE_ADD);
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
