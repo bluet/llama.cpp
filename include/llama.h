@@ -227,6 +227,12 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    // how a control vector is applied to the hidden state of a layer, see llama_set_adapter_cvec_ext
+    enum llama_adapter_cvec_mode {
+        LLAMA_ADAPTER_CVEC_MODE_ADD     = 0, // cur = cur + v
+        LLAMA_ADAPTER_CVEC_MODE_PROJECT = 1, // cur = cur - |v| * (cur . v/|v|) * v/|v|
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -745,6 +751,21 @@ extern "C" {
                          int32_t   n_embd,
                          int32_t   il_start,
                          int32_t   il_end);
+
+    // Same as llama_set_adapter_cvec, with the mode of application:
+    // - LLAMA_ADAPTER_CVEC_MODE_ADD: the vector of each layer is added to the hidden state
+    //   (llama_set_adapter_cvec is equivalent to this mode)
+    // - LLAMA_ADAPTER_CVEC_MODE_PROJECT: the component of the hidden state along the vector of each layer is
+    //   removed, scaled by the norm of the vector (norm 1 removes the component, norm 2 reflects it);
+    //   layers whose vector is zero are left untouched
+    LLAMA_API int32_t llama_set_adapter_cvec_ext(
+                    struct llama_context * ctx,
+                             const float * data,
+                                  size_t   len,
+                                 int32_t   n_embd,
+                                 int32_t   il_start,
+                                 int32_t   il_end,
+            enum llama_adapter_cvec_mode   mode);
 
     //
     // Memory

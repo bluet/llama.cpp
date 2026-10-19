@@ -7,6 +7,7 @@
 #include <map>
 #include <cassert>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -23,9 +24,27 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
 
 ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
     ggml_tensor * layer_dir = tensor_for(il);
-    if (layer_dir != nullptr) {
-        cur = ggml_add(ctx, cur, layer_dir);
+    if (layer_dir == nullptr) {
+        return cur;
     }
+
+    if (mode == LLAMA_ADAPTER_CVEC_MODE_PROJECT) {
+        const float norm = norms[il];
+        if (norm == 0.0f) {
+            // a zero vector has no component to remove
+            return cur;
+        }
+
+        // cur = cur - norm * (cur . dir) * dir, where dir = layer_dir has unit norm
+        ggml_tensor * dot = ggml_mul_mat(ctx, layer_dir, cur); // [1, n_tokens]
+        dot = ggml_scale(ctx, dot, norm);
+
+        ggml_tensor * prj = ggml_mul(ctx, ggml_repeat(ctx, dot, cur), layer_dir); // [n_embd, n_tokens]
+
+        return ggml_sub(ctx, cur, prj);
+    }
+
+    cur = ggml_add(ctx, cur, layer_dir);
 
     return cur;
 }
@@ -75,6 +94,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
         ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
         tensors.push_back(tensor);
     }
+    norms.resize(hparams.n_layer(), 0.0f);
 
     // allocate tensors / buffers and zero
     bufs.reserve(ctx_map.size());
@@ -99,7 +119,8 @@ bool llama_adapter_cvec::apply(
         size_t len,
         int32_t n_embd,
         int32_t il_start,
-        int32_t il_end) {
+        int32_t il_end,
+        llama_adapter_cvec_mode mode) {
     const auto & hparams = model.hparams;
 
     if (data == nullptr) {
@@ -114,6 +135,11 @@ bool llama_adapter_cvec::apply(
         return false;
     }
 
+    if (mode != LLAMA_ADAPTER_CVEC_MODE_ADD && mode != LLAMA_ADAPTER_CVEC_MODE_PROJECT) {
+        LLAMA_LOG_ERROR("%s: invalid control vector mode %d\n", __func__, (int) mode);
+        return false;
+    }
+
     if (tensors.empty()) {
         if (!init(model)) {
             return false;
@@ -123,13 +149,42 @@ bool llama_adapter_cvec::apply(
     layer_start = il_start;
     layer_end   = il_end;
 
+    this->mode = mode;
+
+    std::vector<float> dir; // PROJECT: the direction of the current layer, with unit norm
+
     for (size_t il = 1; il < hparams.n_layer(); il++) {
         assert(tensors[il] != nullptr);
 
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
-        if (off + n_embd <= len) {
-            ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
+        if (off + n_embd > len) {
+            continue;
         }
+
+        const float * src = data + off;
+
+        if (mode == LLAMA_ADAPTER_CVEC_MODE_PROJECT) {
+            // the tensor holds the direction with unit norm, the norm stays on the host and scales the projection
+            double sum = 0.0;
+            for (int32_t i = 0; i < n_embd; i++) {
+                sum += (double) src[i] * src[i];
+            }
+            const float norm = (float) sqrt(sum);
+
+            dir.assign(n_embd, 0.0f);
+            if (norm < 1e-12f) {
+                norms[il] = 0.0f; // skipped by apply_to
+            } else {
+                for (int32_t i = 0; i < n_embd; i++) {
+                    dir[i] = src[i] / norm;
+                }
+                norms[il] = norm;
+            }
+
+            src = dir.data();
+        }
+
+        ggml_backend_tensor_set(tensors[il], src, 0, n_embd * ggml_element_size(tensors[il]));
     }
 
     return true;

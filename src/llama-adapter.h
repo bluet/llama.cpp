@@ -25,7 +25,8 @@ struct llama_adapter_cvec {
             size_t len,
             int32_t n_embd,
             int32_t il_start,
-            int32_t il_end);
+            int32_t il_end,
+            llama_adapter_cvec_mode mode);
 
 private:
     bool init(const llama_model & model);
@@ -33,10 +34,13 @@ private:
     int32_t layer_start = -1;
     int32_t layer_end   = -1;
 
+    llama_adapter_cvec_mode mode = LLAMA_ADAPTER_CVEC_MODE_ADD;
+
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
-    std::vector<ggml_tensor *> tensors; // per layer
+    std::vector<ggml_tensor *> tensors; // per layer: the vector (ADD) or its direction with unit norm (PROJECT)
+    std::vector<float>         norms;   // per layer: the norm of the vector (PROJECT only), 0 when the layer is skipped
 };
 
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;
