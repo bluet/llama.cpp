@@ -537,6 +537,7 @@ struct common_params {
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
+    llama_adapter_cvec_mode control_vector_mode = LLAMA_ADAPTER_CVEC_MODE_ADD; // how the control vectors are applied
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector

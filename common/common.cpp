@@ -1459,13 +1459,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             return res;
         }
 
-        int err = llama_set_adapter_cvec(
+        int err = llama_set_adapter_cvec_ext(
                 lctx,
                 cvec.data.data(),
                 cvec.data.size(),
                 cvec.n_embd,
                 params.control_vector_layer_start,
-                params.control_vector_layer_end);
+                params.control_vector_layer_end,
+                params.control_vector_mode);
         if (err) {
             return res;
         }

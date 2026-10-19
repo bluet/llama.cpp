@@ -3030,6 +3030,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--control-vector-mode"}, "{add,project}",
+        "how the control vector(s) are applied to the hidden state, one of:\n"
+        "- add (default): add the vector\n"
+        "- project: remove the component of the hidden state along the vector, scaled by its norm (1 = remove, 2 = reflect)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "add")     { params.control_vector_mode = LLAMA_ADAPTER_CVEC_MODE_ADD;     }
+            else if (value == "project") { params.control_vector_mode = LLAMA_ADAPTER_CVEC_MODE_PROJECT; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ));
+    add_opt(common_arg(
         {"-a", "--alias"}, "STRING",
         "set model name aliases, comma-separated (to be used by API)",
         [](common_params & params, const std::string & value) {
